@@ -1,11 +1,13 @@
+
 from celery import shared_task
 from django.core.mail import send_mail
 from django.conf import settings
 
+
 @shared_task(
     autoretry_for=(Exception,),
     retry_backoff=True,
-    retry_kwargs={'max_retries': 3}
+    retry_kwargs={"max_retries": 3}
 )
 def send_email_task(subject, message, recipient):
     return send_mail(
@@ -16,10 +18,11 @@ def send_email_task(subject, message, recipient):
         fail_silently=False
     )
 
+
 @shared_task(
     autoretry_for=(Exception,),
     retry_backoff=True,
-    retry_kwargs={'max_retries': 3}
+    retry_kwargs={"max_retries": 3}
 )
 def send_welcome_email_task(name, email):
     subject = "Welcome to Authentication System"
@@ -42,10 +45,11 @@ Authentication System Team
         fail_silently=False
     )
 
+
 @shared_task(
     autoretry_for=(Exception,),
     retry_backoff=True,
-    retry_kwargs={'max_retries': 3}
+    retry_kwargs={"max_retries": 3}
 )
 def send_password_reset_confirmation_task(name, email):
     subject = "Password Reset Successful"
@@ -59,7 +63,6 @@ If you did not make this change, please contact us immediately.
 Thank you!
 Authentication System Team
 """
-
     return send_mail(
         subject,
         message,
