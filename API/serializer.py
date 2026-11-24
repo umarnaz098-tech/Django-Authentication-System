@@ -116,6 +116,9 @@ class ProfileUsernameField(serializers.SlugRelatedField):
                 value=data
             )
 
+    def to_representation(self, value):
+        return value.user.username
+
 
 
 # ============================================================
@@ -185,6 +188,36 @@ class ProfileSerializer(serializers.ModelSerializer):
             many=True,
             context=self.context
         ).data
+
+
+# ============================================================
+# FOLLOW SERIALIZER
+# ============================================================
+
+class FollowSerializer(serializers.ModelSerializer):
+
+    follower = NamedRelatedField(
+        display_field="username",
+        read_only=True
+    )
+
+    following = NamedRelatedField(
+        queryset=User.objects.filter(is_active=True),
+        display_field="username"
+    )
+
+    class Meta:
+        model = Follow
+        fields = "__all__"
+        read_only_fields = [
+            "id",
+            "follower",
+            "created_at",
+        ]
+
+
+class FollowActionSerializer(serializers.Serializer):
+    message = serializers.CharField()
 
 
 class ProfileViewSerializer(serializers.ModelSerializer):
@@ -299,13 +332,6 @@ class CommentSerializer(serializers.ModelSerializer):
         display_field="title"
     )
 
-    parent = NamedPrimaryKeyRelatedField(
-        queryset=Comment.objects.all(),
-        display_field="content",
-        allow_null=True,
-        required=False
-    )
-
     class Meta:
         model = Comment
         fields = "__all__"
@@ -315,51 +341,6 @@ class CommentSerializer(serializers.ModelSerializer):
             "created_at",
         ]
 
-    
-    def validate_parent(self, value):
-        if value is not None:
-            post = self.initial_data.get("post")
-
-            if post is not None:
-                post_id = str(post)
-            elif self.instance is not None:
-                post_id = str(self.instance.post_id)
-            else:
-                post_id = None
-
-            if post_id is not None and str(value.post_id) != post_id:
-                raise serializers.ValidationError(
-                    "Parent comment must belong to the same post."
-                )
-
-        return value
-
-
-
-# ============================================================
-# FOLLOW SERIALIZER
-# ============================================================
-
-class FollowSerializer(serializers.ModelSerializer):
-
-    follower = NamedRelatedField(
-        display_field="username",
-        read_only=True
-    )
-
-    following = NamedRelatedField(
-        queryset=User.objects.filter(is_active=True),
-        display_field="username"
-    )
-
-    class Meta:
-        model = Follow
-        fields = "__all__"
-        read_only_fields = [
-            "id",
-            "follower",
-            "created_at",
-        ]
 
 
 # ============================================================
@@ -412,6 +393,13 @@ class ReactionSerializer(serializers.ModelSerializer):
             "user",
             "created_at",
         ]
+
+
+class ReactionCreateSerializer(serializers.Serializer):
+    reaction_type = serializers.ChoiceField(
+        choices=Reaction.ReactionType.choices,
+        default=Reaction.ReactionType.LIKE,
+    )
 
 
 # ============================================================

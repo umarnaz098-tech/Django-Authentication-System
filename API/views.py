@@ -1,10 +1,7 @@
-
 import logging
-
 from django.contrib.auth.models import User
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
-
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import (
@@ -42,8 +39,10 @@ from .serializer import (
     PostSerializer,
     CommentSerializer,
     FollowSerializer,
+    FollowActionSerializer,
     CommunityMemberSerializer,
     ReactionSerializer,
+    ReactionCreateSerializer,
     ShareSerializer,
     SavePostSerializer,
     ReportSerializer,
@@ -329,8 +328,40 @@ class AuthViewSet(viewsets.ViewSet):
                 )
 
             if not user.is_active:
+                if not can_resend_otp(email):
+                    return Response(
+                        {
+                            "message": (
+                                "Email is not verified. A verification email "
+                                "was sent recently. Please check your inbox."
+                            )
+                        },
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+
+                try:
+                    send_otp_email(email)
+                except Exception:
+                    cache.delete(f"otp_resend_{email}")
+                    logger.exception("Login verification OTP queue failed.")
+
+                    return Response(
+                        {
+                            "message": (
+                                "Email is not verified. The verification "
+                                "email could not be sent. Please try again."
+                            )
+                        },
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    )
+
                 return Response(
-                    {"message": "Please verify your email first."},
+                    {
+                        "message": (
+                            "Email is not verified. A verification OTP was "
+                            "sent. Please verify your email before logging in."
+                        )
+                    },
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
@@ -642,6 +673,11 @@ class ProfileViewSet(viewsets.ModelViewSet):
         IsOwnerOrReadOnly,
     ]
 
+    def get_permissions(self):
+        if self.action == "follow":
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
     parser_classes = [
         MultiPartParser,
         FormParser,
@@ -687,16 +723,52 @@ class ProfileViewSet(viewsets.ModelViewSet):
 
         return profile_view
 
+    @extend_schema(responses=ProfileViewSerializer(many=True))
+    @action(detail=True, methods=["get"])
+    def views(self, request, pk=None):
+
+        profile = self.get_object()
+
+        if profile.user != request.user:
+            return Response(
+                {"message": "You can only view your own profile views."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        queryset = ProfileView.objects.filter(
+            profile=profile
+        ).select_related("viewer", "profile").order_by("-created_at")
+        serializer = ProfileViewSerializer(queryset, many=True)
+
+        return Response(serializer.data)
+
+    @extend_schema(responses=ProfileViewSerializer(many=True))
+    @action(detail=True, methods=["get"])
+    def views_made(self, request, pk=None):
+
+        profile = self.get_object()
+
+        if profile.user != request.user:
+            return Response(
+                {"message": "You can only view your own profile history."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        queryset = ProfileView.objects.filter(
+            viewer=profile.user
+        ).select_related("viewer", "profile").order_by("-created_at")
+        serializer = ProfileViewSerializer(queryset, many=True)
+
+        return Response(serializer.data)
+
     @action(detail=True, methods=["get"])
     def followers(self, request, pk=None):
 
         profile = self.get_object()
-
-        queryset = Follow.objects.filter(
+        follows = Follow.objects.filter(
             following=profile.user
         ).select_related("follower", "following")
-
-        serializer = FollowSerializer(queryset, many=True)
+        serializer = FollowSerializer(follows, many=True)
 
         return Response(serializer.data)
 
@@ -704,16 +776,80 @@ class ProfileViewSet(viewsets.ModelViewSet):
     def following(self, request, pk=None):
 
         profile = self.get_object()
-
-        queryset = Follow.objects.filter(
+        follows = Follow.objects.filter(
             follower=profile.user
         ).select_related("follower", "following")
-
-        serializer = FollowSerializer(queryset, many=True)
+        serializer = FollowSerializer(follows, many=True)
 
         return Response(serializer.data)
 
-    @action(detail=True, methods=["get"])
+    @extend_schema(
+        request=None,
+        responses={
+            200: FollowActionSerializer,
+            201: FollowActionSerializer,
+        },
+    )
+    @action(detail=True, methods=["post"])
+    def follow(self, request, pk=None):
+
+        profile = self.get_object()
+        following = profile.user
+
+        if following == request.user:
+            raise ValidationError(
+                {"detail": "You cannot follow yourself."}
+            )
+
+        if not following.is_active:
+            raise ValidationError(
+                {"detail": "You cannot follow an inactive user."}
+            )
+
+        try:
+            with transaction.atomic():
+                follow, created = Follow.objects.get_or_create(
+                    follower=request.user,
+                    following=following,
+                )
+        except IntegrityError:
+            raise ValidationError(
+                {"detail": "Unable to create follow."}
+            )
+
+        if created:
+            send_social_notification(
+                following,
+                "New follower",
+                (
+                    f"Hello {following.first_name or following.username},\n\n"
+                    f"{request.user.username} started following you."
+                ),
+            )
+            send_social_notification(
+                request.user,
+                "Follow successful",
+                (
+                    f"You are now following "
+                    f"{following.first_name or following.username}."
+                ),
+            )
+
+        return Response(
+            {"message": "Follow successful."},
+            status=(
+                status.HTTP_201_CREATED
+                if created
+                else status.HTTP_200_OK
+            ),
+        )
+
+    @extend_schema(
+        request=SavePostSerializer,
+        responses={201: SavePostSerializer},
+        methods=["POST"],
+    )
+    @action(detail=True, methods=["get", "post"])
     def saved_posts(self, request, pk=None):
 
         profile = self.get_object()
@@ -722,6 +858,56 @@ class ProfileViewSet(viewsets.ModelViewSet):
             return Response(
                 {"message": "You can only view your own saved posts."},
                 status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if request.method == "POST":
+            serializer = SavePostSerializer(
+                data=request.data,
+                context=self.get_serializer_context(),
+            )
+
+            if not serializer.is_valid():
+                return Response(
+                    serializer.errors,
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            post = serializer.validated_data["post"]
+
+            try:
+                with transaction.atomic():
+                    saved_post, created = SavePost.objects.get_or_create(
+                        user=request.user,
+                        post=post,
+                    )
+            except IntegrityError:
+                raise ValidationError(
+                    {"detail": "Unable to save this post."}
+                )
+
+            if not created:
+                raise ValidationError(
+                    {"detail": "You have already saved this post."}
+                )
+
+            if post.author != request.user:
+                send_social_notification(
+                    post.author,
+                    "Your post was saved",
+                    (
+                        f"Hello {post.author.first_name or post.author.username},\n\n"
+                        f"{request.user.username} saved your post "
+                        f"'{post.title}'."
+                    ),
+                )
+
+            response_serializer = SavePostSerializer(
+                saved_post,
+                context=self.get_serializer_context(),
+            )
+            return Response(
+                response_serializer.data,
+                status=status.HTTP_201_CREATED,
             )
 
         queryset = SavePost.objects.filter(
@@ -779,7 +965,12 @@ class ProfileViewSet(viewsets.ModelViewSet):
 
         return Response(serializer.data)
 
-    @action(detail=True, methods=["get"])
+    @extend_schema(
+        request=ReportSerializer,
+        responses={201: ReportSerializer},
+        methods=["POST"],
+    )
+    @action(detail=True, methods=["get", "post"])
     def reports(self, request, pk=None):
 
         profile = self.get_object()
@@ -788,6 +979,50 @@ class ProfileViewSet(viewsets.ModelViewSet):
             return Response(
                 {"message": "You can only view your own reports."},
                 status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if request.method == "POST":
+            serializer = ReportSerializer(
+                data=request.data,
+                context=self.get_serializer_context(),
+            )
+
+            if not serializer.is_valid():
+                return Response(
+                    serializer.errors,
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            report = serializer.save(user=request.user)
+            target = (
+                report.profile.user.username
+                if report.profile
+                else report.post.title
+                if report.post
+                else report.comment.content[:100]
+            )
+            staff_users = User.objects.filter(
+                is_staff=True,
+                is_active=True,
+            ).exclude(email="")
+
+            for staff_user in staff_users:
+                send_social_notification(
+                    staff_user,
+                    "New social media report submitted",
+                    (
+                        f"Hello {staff_user.username},\n\n"
+                        f"A new report has been submitted.\n\n"
+                        f"Reported item: {target}\n"
+                        f"Reason: {report.reason}\n"
+                        f"Description: {report.description or 'No description provided.'}\n"
+                        f"Reported by: {request.user.username}"
+                    ),
+                )
+
+            return Response(
+                serializer.data,
+                status=status.HTTP_201_CREATED,
             )
 
         queryset = Report.objects.filter(user=request.user)
@@ -829,7 +1064,16 @@ class CommunityViewSet(viewsets.ModelViewSet):
     ]
 
     def perform_create(self, serializer):
-        serializer.save(creator=self.request.user)
+        community = serializer.save(creator=self.request.user)
+
+        send_social_notification(
+            community.creator,
+            "Community created",
+            (
+                f"Hello {community.creator.first_name or community.creator.username},\n\n"
+                f"Your community '{community.name}' was created successfully."
+            ),
+        )
 
 
 # ============================================================
@@ -850,6 +1094,11 @@ class PostViewSet(viewsets.ModelViewSet):
         IsOwnerOrReadOnly,
     ]
 
+    def get_permissions(self):
+        if self.action == "reactions":
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
     parser_classes = [
         MultiPartParser,
         FormParser,
@@ -857,7 +1106,73 @@ class PostViewSet(viewsets.ModelViewSet):
     ]
 
     def perform_create(self, serializer):
-        serializer.save(author=self.request.user)
+        post = serializer.save(author=self.request.user)
+
+        send_social_notification(
+            post.author,
+            "Post created",
+            (
+                f"Hello {post.author.first_name or post.author.username},\n\n"
+                f"Your post '{post.title}' was created successfully."
+            ),
+        )
+
+    def retrieve(self, request, *args, **kwargs):
+        post = self.get_object()
+        response = Response(self.get_serializer(post).data)
+
+        if post.author != request.user:
+            self._record_post_view(post, request.user)
+
+        return response
+
+    def _record_post_view(self, post, user):
+        try:
+            with transaction.atomic():
+                post_view, created = PostView.objects.get_or_create(
+                    user=user,
+                    post=post,
+                )
+        except IntegrityError:
+            raise ValidationError(
+                {"detail": "Unable to record post view."}
+            )
+
+        if created and post.author != user:
+            send_social_notification(
+                post.author,
+                "Your post was viewed",
+                (
+                    f"Hello {post.author.first_name or post.author.username},\n\n"
+                    f"{user.username} viewed your post '{post.title}'."
+                ),
+            )
+
+        return post_view
+
+    @action(detail=True, methods=["get"])
+    def views(self, request, pk=None):
+        post = self.get_object()
+
+        if post.author != request.user:
+            return Response(
+                {"detail": "You can only view visitors to your own posts."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        queryset = PostView.objects.filter(
+            post=post,
+        ).select_related("user", "post")
+        serializer = PostViewSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"])
+    def views_made(self, request):
+        queryset = PostView.objects.filter(
+            user=request.user,
+        ).select_related("user", "post")
+        serializer = PostViewSerializer(queryset, many=True)
+        return Response(serializer.data)
 
     @action(detail=True, methods=["get"])
     def comments(self, request, pk=None):
@@ -876,10 +1191,70 @@ class PostViewSet(viewsets.ModelViewSet):
 
         return Response(serializer.data)
 
-    @action(detail=True, methods=["get"])
+    @extend_schema(
+        request=ReactionCreateSerializer,
+        responses={201: ReactionSerializer},
+        methods=["POST"],
+    )
+    @action(detail=True, methods=["get", "post"])
     def reactions(self, request, pk=None):
 
         post = self.get_object()
+
+        if request.method == "POST":
+            create_serializer = ReactionCreateSerializer(data=request.data)
+
+            if not create_serializer.is_valid():
+                return Response(
+                    create_serializer.errors,
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            try:
+                with transaction.atomic():
+                    reaction, created = Reaction.objects.get_or_create(
+                        user=request.user,
+                        post=post,
+                        defaults={
+                            "reaction_type": (
+                                create_serializer.validated_data["reaction_type"]
+                            )
+                        },
+                    )
+            except IntegrityError:
+                raise ValidationError(
+                    {"detail": "Unable to save reaction."}
+                )
+
+            if not created:
+                raise ValidationError(
+                    {
+                        "detail": (
+                            "You have already reacted to this post. "
+                            "Update your existing reaction instead."
+                        )
+                    }
+                )
+
+            if post.author != request.user:
+                send_social_notification(
+                    post.author,
+                    f"Your post received a {reaction.reaction_type.lower()}",
+                    (
+                        f"Hello {post.author.first_name or post.author.username},\n\n"
+                        f"{request.user.username} reacted to your post "
+                        f"'{post.title}' with {reaction.reaction_type}."
+                    ),
+                )
+
+            response_serializer = ReactionSerializer(
+                reaction,
+                context=self.get_serializer_context(),
+            )
+            return Response(
+                response_serializer.data,
+                status=status.HTTP_201_CREATED,
+            )
 
         queryset = Reaction.objects.filter(
             post=post
@@ -937,60 +1312,6 @@ class CommentViewSet(viewsets.ModelViewSet):
 
 
 # ============================================================
-# FOLLOW VIEWSET
-# ============================================================
-
-class FollowViewSet(viewsets.ModelViewSet):
-
-    queryset = Follow.objects.select_related(
-        "follower",
-        "following",
-    ).all()
-
-    serializer_class = FollowSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-
-        return Follow.objects.filter(
-            follower=self.request.user
-        ).select_related("following")
-
-    def perform_create(self, serializer):
-
-        following = serializer.validated_data["following"]
-
-        if following == self.request.user:
-            raise ValidationError(
-                {"following": "You cannot follow yourself."}
-            )
-
-        try:
-            with transaction.atomic():
-                follow, created = Follow.objects.get_or_create(
-                    follower=self.request.user,
-                    following=following,
-                )
-
-        except IntegrityError:
-            raise ValidationError(
-                {"detail": "Unable to create follow request."}
-            )
-
-        serializer.instance = follow
-
-        if created:
-            send_social_notification(
-                following,
-                "New follower",
-                (
-                    f"Hello {following.first_name or following.username},\n\n"
-                    f"{self.request.user.username} started following you."
-                ),
-            )
-
-
-# ============================================================
 # COMMUNITY MEMBER VIEWSET
 # ============================================================
 
@@ -1030,6 +1351,13 @@ class CommunityMemberViewSet(viewsets.ModelViewSet):
 
         creator = community.creator
 
+        if created:
+            send_social_notification(
+                self.request.user,
+                "Community joined",
+                f"You joined the community '{community.name}'.",
+            )
+
         if created and creator != self.request.user:
             send_social_notification(
                 creator,
@@ -1040,116 +1368,6 @@ class CommunityMemberViewSet(viewsets.ModelViewSet):
                     f"{community.name}."
                 ),
             )
-
-
-# ============================================================
-# REACTION VIEWSET
-# ============================================================
-
-class ReactionViewSet(viewsets.ModelViewSet):
-
-    queryset = Reaction.objects.select_related(
-        "user",
-        "post",
-    ).all()
-
-    serializer_class = ReactionSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-
-        return Reaction.objects.filter(
-            user=self.request.user
-        ).select_related("post")
-
-    def perform_create(self, serializer):
-
-        post = serializer.validated_data["post"]
-        reaction_type = serializer.validated_data["reaction_type"]
-
-        try:
-            with transaction.atomic():
-                reaction, created = Reaction.objects.get_or_create(
-                    user=self.request.user,
-                    post=post,
-                    defaults={
-                        "reaction_type": reaction_type
-                    },
-                )
-
-        except IntegrityError:
-            raise ValidationError(
-                {"detail": "Unable to save reaction."}
-            )
-
-        if not created:
-            raise ValidationError(
-                {
-                    "detail": (
-                        "You have already reacted to this post. "
-                        "Update your existing reaction instead."
-                    )
-                }
-            )
-
-        serializer.instance = reaction
-
-        post_owner = post.author
-
-        if post_owner != self.request.user:
-            send_social_notification(
-                post_owner,
-                f"Your post received a {reaction.reaction_type.lower()}",
-                (
-                    f"Hello {post_owner.first_name or post_owner.username},\n\n"
-                    f"{self.request.user.username} reacted to your post "
-                    f"'{post.title}' with {reaction.reaction_type}."
-                ),
-            )
-
-    def perform_update(self, serializer):
-
-        old_reaction = self.get_object()
-        old_type = old_reaction.reaction_type
-
-        new_post = serializer.validated_data.get(
-            "post",
-            old_reaction.post,
-        )
-
-        if new_post.pk != old_reaction.post_id:
-            raise ValidationError(
-                {
-                    "post": (
-                        "You cannot change the post of an existing reaction. "
-                        "Create a new reaction for another post."
-                    )
-                }
-            )
-
-        reaction = serializer.save(
-            user=self.request.user,
-            post=old_reaction.post,
-        )
-
-        if old_type != reaction.reaction_type:
-
-            post_owner = reaction.post.author
-
-            if post_owner != self.request.user:
-                send_social_notification(
-                    post_owner,
-                    (
-                        "Your post reaction changed to "
-                        f"{reaction.reaction_type.lower()}"
-                    ),
-                    (
-                        f"Hello {post_owner.first_name or post_owner.username},\n\n"
-                        f"{self.request.user.username} changed their reaction "
-                        f"on your post '{reaction.post.title}' "
-                        f"to {reaction.reaction_type}."
-                    ),
-                )
 
 
 # ============================================================
@@ -1190,214 +1408,3 @@ class ShareViewSet(viewsets.ModelViewSet):
             )
 
 
-# ============================================================
-# SAVE POST VIEWSET
-# ============================================================
-
-class SavePostViewSet(viewsets.ModelViewSet):
-
-    queryset = SavePost.objects.select_related(
-        "user",
-        "post",
-    ).all()
-
-    serializer_class = SavePostSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-
-        return SavePost.objects.filter(
-            user=self.request.user
-        ).select_related("post")
-
-    def perform_create(self, serializer):
-
-        post = serializer.validated_data["post"]
-
-        try:
-            with transaction.atomic():
-                saved_post, created = SavePost.objects.get_or_create(
-                    user=self.request.user,
-                    post=post,
-                )
-
-        except IntegrityError:
-            raise ValidationError(
-                {"detail": "Unable to save this post."}
-            )
-
-        if not created:
-            raise ValidationError(
-                {"detail": "You have already saved this post."}
-            )
-
-        serializer.instance = saved_post
-
-
-# ============================================================
-# REPORT VIEWSET
-# ============================================================
-
-class ReportViewSet(viewsets.ModelViewSet):
-
-    queryset = Report.objects.select_related(
-        "user",
-        "profile",
-        "post",
-        "comment",
-    ).all()
-
-    serializer_class = ReportSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-
-        if self.request.user.is_staff:
-            return Report.objects.select_related(
-                "user",
-                "profile",
-                "post",
-                "comment",
-            ).all()
-
-        return Report.objects.filter(
-            user=self.request.user
-        ).select_related(
-            "profile",
-            "post",
-            "comment",
-        )
-
-    def perform_create(self, serializer):
-
-        report = serializer.save(user=self.request.user)
-
-        target = (
-            report.profile.user.username
-            if report.profile
-            else report.post.title
-            if report.post
-            else report.comment.content[:100]
-        )
-
-        staff_users = User.objects.filter(
-            is_staff=True,
-            is_active=True,
-        ).exclude(email="")
-
-        for staff_user in staff_users:
-            send_social_notification(
-                staff_user,
-                "New social media report submitted",
-                (
-                    f"Hello {staff_user.username},\n\n"
-                    f"A new report has been submitted.\n\n"
-                    f"Reported item: {target}\n"
-                    f"Reason: {report.reason}\n"
-                    f"Description: {report.description or 'No description provided.'}\n"
-                    f"Reported by: {self.request.user.username}"
-                ),
-            )
-
-
-# ============================================================
-# POST VIEW TRACKING VIEWSET
-# ============================================================
-
-class PostViewViewSet(viewsets.ModelViewSet):
-
-    queryset = PostView.objects.select_related(
-        "user",
-        "post",
-    ).all()
-
-    serializer_class = PostViewSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-
-        return PostView.objects.filter(
-            user=self.request.user
-        ).select_related("post")
-
-    def perform_create(self, serializer):
-
-        post = serializer.validated_data["post"]
-
-        try:
-            with transaction.atomic():
-                post_view, created = PostView.objects.get_or_create(
-                    user=self.request.user,
-                    post=post,
-                )
-
-        except IntegrityError:
-            raise ValidationError(
-                {"detail": "Unable to record post view."}
-            )
-
-        serializer.instance = post_view
-
-        post_owner = post.author
-
-        if created and post_owner != self.request.user:
-            send_social_notification(
-                post_owner,
-                "Your post was viewed",
-                (
-                    f"Hello {post_owner.first_name or post_owner.username},\n\n"
-                    f"{self.request.user.username} viewed your post "
-                    f"'{post.title}'."
-                ),
-            )
-
-
-# ============================================================
-# PROFILE VIEW TRACKING VIEWSET
-# ============================================================
-
-class ProfileViewViewSet(viewsets.ModelViewSet):
-
-    queryset = ProfileView.objects.select_related(
-        "viewer",
-        "profile",
-    ).all()
-
-    serializer_class = ProfileViewSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-
-        return ProfileView.objects.filter(
-            viewer=self.request.user
-        ).select_related("profile")
-
-    def perform_create(self, serializer):
-
-        profile = serializer.validated_data["profile"]
-
-        if profile.user == self.request.user:
-            raise ValidationError(
-                {
-                    "profile": (
-                        "You cannot record a visit to your own profile."
-                    )
-                }
-            )
-
-        profile_view, created = ProfileView.objects.get_or_create(
-            viewer=self.request.user,
-            profile=profile,
-        )
-
-        serializer.instance = profile_view
-
-        if created:
-            send_social_notification(
-                profile.user,
-                "Your profile was viewed",
-                (
-                    f"Hello {profile.user.first_name or profile.user.username},\n\n"
-                    f"{self.request.user.username} viewed your profile."
-                ),
-            )

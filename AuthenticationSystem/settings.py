@@ -113,7 +113,11 @@ REST_FRAMEWORK = {
 # API documentation
 SPECTACULAR_SETTINGS = {
     "TITLE": "Authentication API",
-    "DESCRIPTION": "Django Authentication System with JWT and OTP",
+    "DESCRIPTION": (
+        "Django Authentication System with JWT and OTP. "
+        "Login, then click Authorize and enter your access token "
+        "(not your refresh token) to use protected APIs."
+    ),
     "VERSION": "1.0.0",
     "COMPONENT_SPLIT_REQUEST": True,
 }
